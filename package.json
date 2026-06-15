@@ -1,0 +1,17 @@
+{
+  "name": "qht-drive-to-youtube",
+  "version": "1.0.0",
+  "description": "Streams a video from a Google Drive folder straight to YouTube and sets its thumbnail.",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "googleapis": "^144.0.0"
+  }
+}
