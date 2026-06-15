@@ -191,9 +191,12 @@ async function processDueJobs() {
       listData[i].uploading = true;
       await writeList(listData);
       try {
+        // Upload at the scheduled time with the chosen visibility (default Public = live now).
+        // No publishAt: we are already uploading AT the scheduled time, so it goes live immediately.
+        const finalStatus = job.publishStatus || "public";
         const result = await runTransfer({
           driveUrl: job.driveUrl, title: job.title, description: job.description,
-          tags: job.tags, status: job.status === "Scheduled" ? "public" : job.status, publishAt: job.publishAt,
+          tags: job.tags, status: finalStatus,
         });
         listData = await readList();
         const j = listData.findIndex((x) => x.id === job.id);
@@ -203,7 +206,7 @@ async function processDueJobs() {
             videoId: result.videoId,
             videoUrl: "https://youtu.be/" + result.videoId,
             thumbnail: listData[j].thumbnail || "https://i.ytimg.com/vi/" + result.videoId + "/hqdefault.jpg",
-            status: job.publishAt ? "Scheduled" : "Public",
+            status: finalStatus.charAt(0).toUpperCase() + finalStatus.slice(1),
             pendingUpload: false, uploading: false, scheduledAt: null, uploadError: null,
           };
           await writeList(listData);
