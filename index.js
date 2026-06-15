@@ -143,3 +143,63 @@ app.post("/api/transfer", async (req, res) => {
     res.end();
   }
 });
+
+let processing = false;
+async function processDueJobs() {
+  if (processing) return;
+  processing = true;
+  try {
+    const now = Date.now();
+    let listData = await readList();
+    const due = listData.filter((v) => v && v.pendingUpload && !v.uploading && v.scheduledAt && new Date(v.scheduledAt).getTime() <= now);
+    for (const job of due.slice(0, 3)) {
+      listData = await readList();
+      const i = listData.findIndex((x) => x.id === job.id);
+      if (i < 0 || listData[i].uploading || !listData[i].pendingUpload) continue;
+      listData[i].uploading = true;
+      await writeList(listData);
+      try {
+        const finalStatus = job.publishStatus || "public";
+        const result = await runTransfer({ driveUrl: job.driveUrl, title: job.title, description: job.description, tags: job.tags, status: finalStatus });
+        listData = await readList();
+        const j = listData.findIndex((x) => x.id === job.id);
+        if (j >= 0) {
+          listData[j] = {
+            ...listData[j],
+            videoId: result.videoId,
+            videoUrl: "https://youtu.be/" + result.videoId,
+            thumbnail: listData[j].thumbnail || "https://i.ytimg.com/vi/" + result.videoId + "/hqdefault.jpg",
+            status: finalStatus.charAt(0).toUpperCase() + finalStatus.slice(1),
+            pendingUpload: false, uploading: false, scheduledAt: null, uploadError: null,
+          };
+          await writeList(listData);
+        }
+      } catch (e) {
+        listData = await readList();
+        const j = listData.findIndex((x) => x.id === job.id);
+        if (j >= 0) { listData[j] = { ...listData[j], uploading: false, uploadError: (e && e.message ? e.message : String(e)) }; await writeList(listData); }
+      }
+    }
+  } catch (e) {
+    console.error("processDueJobs error:", e && e.message ? e.message : e);
+  } finally {
+    processing = false;
+  }
+}
+
+app.get("/process-due", (req, res) => {
+  res.json({ ok: true, started: true });
+  processDueJobs().catch((e) => console.error(e));
+});
+
+app.get("/", (_req, res) => res.json({
+  ok: true,
+  service: "qht-drive-to-youtube",
+  driveAuthorized: !!driveToken(),
+  ytAuthorized: !!ytToken(),
+  authorized: !!(driveToken() && ytToken()),
+  kvConfigured: !!CF_DATA_URL,
+}));
+
+app.listen(PORT, () => console.log("Drive->YouTube server on port " + PORT));
+
