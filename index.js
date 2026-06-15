@@ -113,13 +113,20 @@ app.post("/api/transfer", async (req, res) => {
 
     const privacy = ["public", "unlisted", "private"].includes(String(req.body.status || "").toLowerCase()) ? String(req.body.status).toLowerCase() : "private";
 
+    // Schedule: if publishAt is given, upload as private now and let YouTube publish it then.
+    const statusObj = { privacyStatus: privacy };
+    if (req.body.publishAt) {
+      statusObj.privacyStatus = "private";
+      statusObj.publishAt = req.body.publishAt; // RFC3339 / ISO, e.g. 2026-06-20T10:00:00.000Z
+    }
+
     let lastPct = -1;
     const insert = await youtube.videos.insert(
       {
         part: ["snippet", "status"],
         requestBody: {
           snippet: { title: req.body.title || video.name, description: req.body.description || "", tags: Array.isArray(req.body.tags) ? req.body.tags : [], categoryId: "22" },
-          status: { privacyStatus: privacy },
+          status: statusObj,
         },
         media: { body: videoStream },
       },
