@@ -107,17 +107,24 @@ async function runTransfer(job, onProgress) {
 
   const videoId = insert.data.id;
   let thumbnailSet = false;
+  let thumbError = null;
   if (image) {
     try {
       const imgStream = (await drive.files.get({ fileId: image.id, alt: "media", supportsAllDrives: true }, { responseType: "stream" })).data;
       await youtube.thumbnails.set({ videoId, media: { mimeType: image.mimeType || "image/jpeg", body: imgStream } });
       thumbnailSet = true;
+      console.log("THUMBNAIL OK for", videoId, "image:", image.name);
       if (onProgress) onProgress({ stage: "thumbnail", message: "Thumbnail set" });
     } catch (e) {
-      if (onProgress) onProgress({ stage: "thumbnail_failed", message: "Thumbnail failed: " + (e && e.message ? e.message : e) });
+      thumbError = (e && e.message ? e.message : String(e));
+      console.error("THUMBNAIL FAILED for", videoId, "image:", image.name, "->", thumbError);
+      if (onProgress) onProgress({ stage: "thumbnail_failed", message: "Thumbnail failed: " + thumbError });
     }
+  } else {
+    thumbError = "no image file found in the folder";
+    console.log("THUMBNAIL: no image found in folder for", videoId);
   }
-  return { videoId, privacy, title: job.title || video.name, thumbnailSet };
+  return { videoId, privacy, title: job.title || video.name, thumbnailSet, thumbError };
 }
 
 // ---- Cloudflare KV (videos list) read/write, used for scheduled jobs ----
@@ -174,6 +181,23 @@ app.post("/api/transfer", async (req, res) => {
   }
 });
 
+// ---- delete a video from YouTube (called when deleting from the dashboard) ----
+app.post("/api/delete", async (req, res) => {
+  if (ACCESS_KEY && req.headers["x-access-key"] !== ACCESS_KEY) return res.status(401).json({ error: "unauthorized" });
+  const videoId = req.body && req.body.videoId;
+  if (!videoId) return res.status(400).json({ error: "videoId required" });
+  try {
+    const youtube = google.youtube({ version: "v3", auth: clientFor(ytToken()) });
+    await youtube.videos.delete({ id: videoId });
+    console.log("Deleted from YouTube:", videoId);
+    res.json({ ok: true, deleted: videoId });
+  } catch (e) {
+    const msg = e && e.message ? e.message : String(e);
+    console.error("YouTube delete failed for", videoId, "->", msg);
+    res.status(500).json({ error: msg });
+  }
+});
+
 // ---- scheduled jobs: upload any that are due ----
 let processing = false;
 async function processDueJobs() {
@@ -207,7 +231,8 @@ async function processDueJobs() {
             videoUrl: "https://youtu.be/" + result.videoId,
             thumbnail: listData[j].thumbnail || "https://i.ytimg.com/vi/" + result.videoId + "/hqdefault.jpg",
             status: finalStatus.charAt(0).toUpperCase() + finalStatus.slice(1),
-            pendingUpload: false, uploading: false, scheduledAt: null, uploadError: null,
+            pendingUpload: false, uploading: false, scheduledAt: null,
+            uploadError: result.thumbError ? ("Thumbnail: " + result.thumbError) : null,
           };
           await writeList(listData);
         }
