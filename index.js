@@ -38,7 +38,21 @@ const SCOPES = [
 ];
 
 const driveToken = () => GOOGLE_REFRESH_TOKEN_DRIVE || GOOGLE_REFRESH_TOKEN;
-const ytToken = () => GOOGLE_REFRESH_TOKEN_YT || GOOGLE_REFRESH_TOKEN;
+
+// ---- Multiple YouTube channels ----
+// Configure channels with env vars: YT1_NAME / YT1_TOKEN, YT2_NAME / YT2_TOKEN, ... (up to 10).
+// Old single GOOGLE_REFRESH_TOKEN_YT still works as a fallback "Default channel".
+const YT_CHANNELS = [];
+for (let i = 1; i <= 10; i++) {
+  const token = process.env["YT" + i + "_TOKEN"];
+  if (token) YT_CHANNELS.push({ id: "yt" + i, name: process.env["YT" + i + "_NAME"] || ("Channel " + i), token });
+}
+if (!YT_CHANNELS.length && (GOOGLE_REFRESH_TOKEN_YT || GOOGLE_REFRESH_TOKEN)) {
+  YT_CHANNELS.push({ id: "default", name: "Default channel", token: GOOGLE_REFRESH_TOKEN_YT || GOOGLE_REFRESH_TOKEN });
+}
+function ytChannelBy(id) { return YT_CHANNELS.find((c) => c.id === id) || YT_CHANNELS[0]; }
+function ytTokenFor(id) { const c = ytChannelBy(id); return c ? c.token : (GOOGLE_REFRESH_TOKEN_YT || GOOGLE_REFRESH_TOKEN); }
+const ytToken = () => ytTokenFor();
 
 const app = express();
 app.use(express.json());
@@ -68,7 +82,8 @@ function driveIdFromLink(link) {
 // ---- the actual Drive -> YouTube transfer (used by both immediate and scheduled paths) ----
 async function runTransfer(job, onProgress) {
   const drive = google.drive({ version: "v3", auth: clientFor(driveToken()) });
-  const youtube = google.youtube({ version: "v3", auth: clientFor(ytToken()) });
+  const ch = ytChannelBy(job.channel);
+  const youtube = google.youtube({ version: "v3", auth: clientFor(ytTokenFor(job.channel)) });
 
   const folderId = driveIdFromLink(job.driveUrl);
   if (!folderId) throw new Error("Could not read a folder id from that Drive link.");
@@ -124,7 +139,7 @@ async function runTransfer(job, onProgress) {
     thumbError = "no image file found in the folder";
     console.log("THUMBNAIL: no image found in folder for", videoId);
   }
-  return { videoId, privacy, title: job.title || video.name, thumbnailSet, thumbError };
+  return { videoId, privacy, title: job.title || video.name, thumbnailSet, thumbError, channelName: ch ? ch.name : "", channel: ch ? ch.id : "" };
 }
 
 // ---- Cloudflare KV (videos list) read/write, used for scheduled jobs ----
@@ -173,7 +188,7 @@ app.post("/api/transfer", async (req, res) => {
   try {
     send({ stage: "listing", message: "Reading the Drive folder..." });
     const result = await runTransfer(req.body, send);
-    send({ stage: "done", videoId: result.videoId, title: result.title, privacy: result.privacy });
+    send({ stage: "done", videoId: result.videoId, title: result.title, privacy: result.privacy, channelName: result.channelName, channel: result.channel });
   } catch (e) {
     send({ error: e && e.message ? e.message : String(e) });
   } finally {
@@ -187,7 +202,7 @@ app.post("/api/delete", async (req, res) => {
   const videoId = req.body && req.body.videoId;
   if (!videoId) return res.status(400).json({ error: "videoId required" });
   try {
-    const youtube = google.youtube({ version: "v3", auth: clientFor(ytToken()) });
+    const youtube = google.youtube({ version: "v3", auth: clientFor(ytTokenFor(req.body.channel)) });
     await youtube.videos.delete({ id: videoId });
     console.log("Deleted from YouTube:", videoId);
     res.json({ ok: true, deleted: videoId });
@@ -220,7 +235,7 @@ async function processDueJobs() {
         const finalStatus = job.publishStatus || "public";
         const result = await runTransfer({
           driveUrl: job.driveUrl, title: job.title, description: job.description,
-          tags: job.tags, status: finalStatus,
+          tags: job.tags, status: finalStatus, channel: job.channel,
         });
         listData = await readList();
         const j = listData.findIndex((x) => x.id === job.id);
@@ -231,6 +246,7 @@ async function processDueJobs() {
             videoUrl: "https://youtu.be/" + result.videoId,
             thumbnail: listData[j].thumbnail || "https://i.ytimg.com/vi/" + result.videoId + "/hqdefault.jpg",
             status: finalStatus.charAt(0).toUpperCase() + finalStatus.slice(1),
+            channelName: result.channelName || listData[j].channelName || "",
             pendingUpload: false, uploading: false, scheduledAt: null,
             uploadError: result.thumbError ? ("Thumbnail: " + result.thumbError) : null,
           };
@@ -254,6 +270,9 @@ app.get("/process-due", (req, res) => {
   processDueJobs().catch((e) => console.error(e));
 });
 
+// List the configured YouTube channels (id + name only, no tokens) for the dashboard dropdown.
+app.get("/channels", (_req, res) => res.json(YT_CHANNELS.map((c) => ({ id: c.id, name: c.name }))));
+
 app.get("/", (_req, res) => res.json({
   ok: true,
   service: "qht-drive-to-youtube",
@@ -261,6 +280,7 @@ app.get("/", (_req, res) => res.json({
   ytAuthorized: !!ytToken(),
   authorized: !!(driveToken() && ytToken()),
   kvConfigured: !!CF_DATA_URL,
+  channels: YT_CHANNELS.map((c) => c.name),
 }));
 
 app.listen(PORT, () => console.log("Drive->YouTube server on port " + PORT));
