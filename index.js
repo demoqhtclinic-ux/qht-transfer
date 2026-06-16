@@ -40,8 +40,12 @@ const SCOPES = [
 const driveToken = () => GOOGLE_REFRESH_TOKEN_DRIVE || GOOGLE_REFRESH_TOKEN;
 
 // ---- Multiple YouTube channels ----
-// Configure channels with env vars: YT1_NAME / YT1_TOKEN, YT2_NAME / YT2_TOKEN, ... (up to 10).
-// Old single GOOGLE_REFRESH_TOKEN_YT still works as a fallback "Default channel".
+// Channels come from two places:
+//   1. Env vars  YT1_NAME / YT1_TOKEN, YT2_NAME / YT2_TOKEN, ... (up to 10).
+//      Old single GOOGLE_REFRESH_TOKEN_YT still works as a fallback "Default channel".
+//   2. Added at runtime from the dashboard's "Add a YouTube channel" button (the /auth flow).
+//      Those are cached in memory and persisted to Cloudflare KV (when CF_DATA_URL is set) so
+//      they survive restarts/redeploys — no env var editing needed.
 const YT_CHANNELS = [];
 for (let i = 1; i <= 10; i++) {
   const token = process.env["YT" + i + "_TOKEN"];
@@ -50,9 +54,32 @@ for (let i = 1; i <= 10; i++) {
 if (!YT_CHANNELS.length && (GOOGLE_REFRESH_TOKEN_YT || GOOGLE_REFRESH_TOKEN)) {
   YT_CHANNELS.push({ id: "default", name: "Default channel", token: GOOGLE_REFRESH_TOKEN_YT || GOOGLE_REFRESH_TOKEN });
 }
-function ytChannelBy(id) { return YT_CHANNELS.find((c) => c.id === id) || YT_CHANNELS[0]; }
+
+// Channels added at runtime via the dashboard. Stored as [{id, name, token}].
+let dynamicChannels = [];
+const channelsKvUrl = () => (CF_DATA_URL ? CF_DATA_URL.replace(/\/+$/, "") + "/channels" : "");
+async function loadDynamicChannels() {
+  if (!channelsKvUrl()) return;
+  try {
+    const r = await fetch(channelsKvUrl(), { headers: CF_DATA_KEY ? { "x-access-key": CF_DATA_KEY } : {} });
+    if (r.ok) { const d = await r.json(); if (Array.isArray(d)) dynamicChannels = d; }
+  } catch (e) { console.error("loadDynamicChannels:", e && e.message ? e.message : e); }
+}
+async function saveDynamicChannels() {
+  if (!channelsKvUrl()) return; // CF not configured → in-memory only (lost on restart)
+  await fetch(channelsKvUrl(), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", ...(CF_DATA_KEY ? { "x-access-key": CF_DATA_KEY } : {}) },
+    body: JSON.stringify(dynamicChannels),
+  });
+}
+
+function allChannels() { return [...YT_CHANNELS, ...dynamicChannels]; }
+function ytChannelBy(id) { const all = allChannels(); return all.find((c) => c.id === id) || all[0]; }
 function ytTokenFor(id) { const c = ytChannelBy(id); return c ? c.token : (GOOGLE_REFRESH_TOKEN_YT || GOOGLE_REFRESH_TOKEN); }
 const ytToken = () => ytTokenFor();
+
+const escapeHtml = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
 const app = express();
 app.use(express.json());
@@ -160,17 +187,55 @@ async function writeList(listData) {
 }
 
 // ---- one-time auth ----
-app.get("/auth", (_req, res) => {
-  const url = oauthClient().generateAuthUrl({ access_type: "offline", prompt: "consent", scope: SCOPES });
+// /auth          -> legacy: shows the refresh token to copy into an env var (README Part C).
+// /auth?add=1    -> dashboard "Add channel" flow: auto-registers the signed-in channel.
+//                   Optional &name=<label> overrides the auto-detected channel title.
+app.get("/auth", (req, res) => {
+  const state = JSON.stringify({ add: req.query.add === "1", name: req.query.name ? String(req.query.name) : "" });
+  const url = oauthClient().generateAuthUrl({ access_type: "offline", prompt: "consent", scope: SCOPES, state });
   res.redirect(url);
 });
 app.get("/oauth2callback", async (req, res) => {
   try {
     const { tokens } = await oauthClient().getToken(req.query.code);
     const rt = tokens.refresh_token;
-    res.type("html").send(rt
-      ? `<h2>Success</h2><p>Copy this refresh token (use as GOOGLE_REFRESH_TOKEN_DRIVE or GOOGLE_REFRESH_TOKEN_YT), then redeploy:</p><pre style="white-space:pre-wrap;word-break:break-all;background:#eee;padding:12px">${rt}</pre>`
-      : `<h2>No refresh token.</h2><p>Remove the app at myaccount.google.com/permissions, then open /auth again.</p>`);
+    let st = {};
+    try { st = JSON.parse(req.query.state || "{}"); } catch {}
+
+    if (!rt) {
+      return res.type("html").send(`<h2>No refresh token.</h2><p>Remove the app at myaccount.google.com/permissions, then open /auth again.</p>`);
+    }
+
+    // Legacy flow (opened /auth directly): show the token for manual env setup.
+    if (!st.add) {
+      return res.type("html").send(`<h2>Success</h2><p>Copy this refresh token (use as GOOGLE_REFRESH_TOKEN_DRIVE or GOOGLE_REFRESH_TOKEN_YT), then redeploy:</p><pre style="white-space:pre-wrap;word-break:break-all;background:#eee;padding:12px">${escapeHtml(rt)}</pre>`);
+    }
+
+    // Dashboard "Add channel" flow: detect which channel this account owns and register it.
+    let channelName = st.name || "", channelId = "";
+    try {
+      const yt = google.youtube({ version: "v3", auth: clientFor(rt) });
+      const me = await yt.channels.list({ part: ["snippet"], mine: true });
+      const mine = me.data.items && me.data.items[0];
+      if (mine) { channelId = mine.id; if (!channelName) channelName = mine.snippet && mine.snippet.title; }
+    } catch (e) { console.error("channels.list(mine) failed:", e && e.message ? e.message : e); }
+
+    const id = channelId || ("ch_" + Date.now().toString(36));
+    await loadDynamicChannels();
+    dynamicChannels = dynamicChannels.filter((c) => c.id !== id); // replace if this channel was added before
+    dynamicChannels.push({ id, name: channelName || ("Channel " + (allChannels().length + 1)), token: rt });
+    let persisted = true;
+    try { await saveDynamicChannels(); persisted = !!channelsKvUrl(); }
+    catch (e) { persisted = false; console.error("saveDynamicChannels:", e && e.message ? e.message : e); }
+
+    res.type("html").send(
+      `<div style="font-family:system-ui,Segoe UI,Arial;max-width:560px;margin:60px auto;text-align:center;line-height:1.6">
+         <h2 style="color:#0e8c7e;margin-bottom:6px">&#10003; Channel added</h2>
+         <p><b>${escapeHtml(channelName || id)}</b> is now available in the dashboard's channel dropdown.</p>
+         ${persisted ? "" : `<p style="color:#b45309">Note: this channel is kept in memory only (CF_DATA_URL not set, or save failed), so it may be lost if the server restarts.</p>`}
+         <p style="color:#555">You can close this tab and go back to the dashboard.</p>
+       </div>`
+    );
   } catch (e) {
     res.status(500).send("Auth failed: " + (e && e.message ? e.message : String(e)));
   }
@@ -179,6 +244,7 @@ app.get("/oauth2callback", async (req, res) => {
 // ---- immediate upload (streams progress) ----
 app.post("/api/transfer", async (req, res) => {
   if (ACCESS_KEY && req.headers["x-access-key"] !== ACCESS_KEY) return res.status(401).json({ error: "unauthorized" });
+  await loadDynamicChannels(); // make sure dashboard-added channels are known before we pick a token
   if (!driveToken() || !ytToken()) return res.status(500).json({ error: "Server not authorized yet - set GOOGLE_REFRESH_TOKEN_DRIVE and GOOGLE_REFRESH_TOKEN_YT." });
 
   res.set("Content-Type", "application/x-ndjson");
@@ -202,6 +268,7 @@ app.post("/api/delete", async (req, res) => {
   const videoId = req.body && req.body.videoId;
   if (!videoId) return res.status(400).json({ error: "videoId required" });
   try {
+    await loadDynamicChannels();
     const youtube = google.youtube({ version: "v3", auth: clientFor(ytTokenFor(req.body.channel)) });
     await youtube.videos.delete({ id: videoId });
     console.log("Deleted from YouTube:", videoId);
@@ -219,6 +286,7 @@ async function processDueJobs() {
   if (processing) return;
   processing = true;
   try {
+    await loadDynamicChannels();
     const now = Date.now();
     let listData = await readList();
     const due = listData.filter((v) => v && v.pendingUpload && !v.uploading && v.scheduledAt && new Date(v.scheduledAt).getTime() <= now);
@@ -271,16 +339,28 @@ app.get("/process-due", (req, res) => {
 });
 
 // List the configured YouTube channels (id + name only, no tokens) for the dashboard dropdown.
-app.get("/channels", (_req, res) => res.json(YT_CHANNELS.map((c) => ({ id: c.id, name: c.name }))));
+app.get("/channels", async (_req, res) => {
+  await loadDynamicChannels(); // pick up channels added on another instance / since startup
+  res.json(allChannels().map((c) => ({ id: c.id, name: c.name })));
+});
 
-app.get("/", (_req, res) => res.json({
-  ok: true,
-  service: "qht-drive-to-youtube",
-  driveAuthorized: !!driveToken(),
-  ytAuthorized: !!ytToken(),
-  authorized: !!(driveToken() && ytToken()),
-  kvConfigured: !!CF_DATA_URL,
-  channels: YT_CHANNELS.map((c) => c.name),
-}));
+app.get("/", async (_req, res) => {
+  await loadDynamicChannels();
+  res.json({
+    ok: true,
+    service: "qht-drive-to-youtube",
+    driveAuthorized: !!driveToken(),
+    ytAuthorized: !!ytToken(),
+    authorized: !!(driveToken() && ytToken()),
+    kvConfigured: !!CF_DATA_URL,
+    channels: allChannels().map((c) => c.name),
+  });
+});
 
-app.listen(PORT, () => console.log("Drive->YouTube server on port " + PORT));
+app.listen(PORT, () => {
+  console.log("Drive->YouTube server on port " + PORT);
+  loadDynamicChannels().then(() => {
+    const n = allChannels().length;
+    if (n) console.log("Channels available: " + allChannels().map((c) => c.name).join(", "));
+  });
+});
