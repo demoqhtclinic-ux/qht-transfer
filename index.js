@@ -341,7 +341,26 @@ app.get("/process-due", (req, res) => {
 // List the configured YouTube channels (id + name only, no tokens) for the dashboard dropdown.
 app.get("/channels", async (_req, res) => {
   await loadDynamicChannels(); // pick up channels added on another instance / since startup
-  res.json(allChannels().map((c) => ({ id: c.id, name: c.name })));
+  // Env-var channels can't be removed from the dashboard; mark them so the UI hides the X.
+  const envIds = new Set(YT_CHANNELS.map((c) => c.id));
+  res.json(allChannels().map((c) => ({ id: c.id, name: c.name, removable: !envIds.has(c.id) })));
+});
+
+// Remove a dashboard-added channel from the list (does NOT touch the YouTube channel itself).
+app.post("/channels/delete", async (req, res) => {
+  if (ACCESS_KEY && req.headers["x-access-key"] !== ACCESS_KEY) return res.status(401).json({ error: "unauthorized" });
+  const id = req.body && req.body.id;
+  if (!id) return res.status(400).json({ error: "id required" });
+  if (YT_CHANNELS.some((c) => c.id === id)) {
+    return res.status(400).json({ error: "This channel is set via env vars and can't be removed from the dashboard." });
+  }
+  await loadDynamicChannels();
+  const before = dynamicChannels.length;
+  dynamicChannels = dynamicChannels.filter((c) => c.id !== id);
+  if (dynamicChannels.length === before) return res.status(404).json({ error: "channel not found" });
+  try { await saveDynamicChannels(); } catch (e) { return res.status(500).json({ error: "save failed: " + (e && e.message ? e.message : e) }); }
+  console.log("Channel removed:", id);
+  res.json({ ok: true });
 });
 
 app.get("/", async (_req, res) => {
