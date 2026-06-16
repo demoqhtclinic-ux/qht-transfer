@@ -280,6 +280,49 @@ app.post("/api/delete", async (req, res) => {
   }
 });
 
+// ---- edit an already-uploaded YouTube video (title / description / tags / privacy) ----
+app.post("/api/update", async (req, res) => {
+  if (ACCESS_KEY && req.headers["x-access-key"] !== ACCESS_KEY) return res.status(401).json({ error: "unauthorized" });
+  const { videoId, channel, title, description, tags, status } = req.body || {};
+  if (!videoId) return res.status(400).json({ error: "videoId required" });
+  try {
+    await loadDynamicChannels();
+    const youtube = google.youtube({ version: "v3", auth: clientFor(ytTokenFor(channel)) });
+
+    // YouTube's videos.update REPLACES the snippet, so read the current one first and
+    // merge our changes onto it (this keeps categoryId etc. and avoids wiping fields).
+    const cur = await youtube.videos.list({ part: "snippet,status", id: videoId });
+    const item = cur.data.items && cur.data.items[0];
+    if (!item) return res.status(404).json({ error: "Video not found on this channel — is the right channel selected?" });
+    const snip = item.snippet || {};
+
+    const snippet = {
+      categoryId: snip.categoryId || "22",
+      title: (title != null && String(title).trim() !== "" ? title : snip.title) || "Untitled",
+      description: description != null ? description : (snip.description || ""),
+      tags: Array.isArray(tags) ? tags : (snip.tags || []),
+    };
+    const requestBody = { id: videoId, snippet };
+    let part = "snippet";
+
+    // Optional privacy change (Public / Private / Unlisted). "Scheduled" is ignored here.
+    const privacyMap = { Public: "public", Private: "private", Unlisted: "unlisted" };
+    if (status && privacyMap[status]) {
+      const st = item.status || {};
+      requestBody.status = { privacyStatus: privacyMap[status], selfDeclaredMadeForKids: st.selfDeclaredMadeForKids || false };
+      part = "snippet,status";
+    }
+
+    await youtube.videos.update({ part, requestBody });
+    console.log("Updated on YouTube:", videoId, "(tags:", snippet.tags.length, ")");
+    res.json({ ok: true, updated: videoId, tags: snippet.tags.length });
+  } catch (e) {
+    const msg = e && e.message ? e.message : String(e);
+    console.error("YouTube update failed for", videoId, "->", msg);
+    res.status(500).json({ error: msg });
+  }
+});
+
 // ---- scheduled jobs: upload any that are due ----
 let processing = false;
 async function processDueJobs() {
