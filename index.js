@@ -14,6 +14,7 @@
 //   CF_DATA_KEY (optional)       -> access key for that Worker
 //   ACCESS_KEY (optional), ALLOWED_ORIGIN (optional), PORT
 
+import "dotenv/config"; // loads variables from a local .env file (configurable on the server)
 import express from "express";
 import { google } from "googleapis";
 
@@ -29,6 +30,7 @@ const {
   ACCESS_KEY,
   ALLOWED_ORIGIN = "*",
   PORT = 8080,
+  HOST = "127.0.0.1", // bind to localhost only; nginx reverse-proxies to it (safe behind a proxy)
 } = process.env;
 
 const SCOPES = [
@@ -419,8 +421,8 @@ app.get("/", async (_req, res) => {
   });
 });
 
-app.listen(PORT, () => {
-  console.log("Drive->YouTube server on port " + PORT);
+app.listen(PORT, HOST, () => {
+  console.log("Drive->YouTube server on " + HOST + ":" + PORT);
   loadDynamicChannels().then(() => {
     const n = allChannels().length;
     if (n) console.log("Channels available: " + allChannels().map((c) => c.name).join(", "));
